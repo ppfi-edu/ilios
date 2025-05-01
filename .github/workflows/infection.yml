@@ -1,0 +1,47 @@
+name: Infection Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '33 3 * * 1' # weekly, on Monday morning
+
+env:
+  MAILER_DSN: null://null
+  ILIOS_LOCALE: en
+  ILIOS_SECRET: ThisTokenIsNotSoSecretChangeIt
+  ILIOS_FILE_SYSTEM_STORAGE_PATH: /tmp
+  SYMFONY_DEPRECATIONS_HELPER: disabled=1
+  MESSENGER_TRANSPORT_DSN: doctrine://default
+  minimum_php_version: 8.3
+  DOCKER_BUILDKIT: 1
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_ILIOS_DEPLOYMENT_WEBHOOK_URL }}
+
+jobs:
+  infection:
+    name: Infection tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use PHP ${{ env.minimum_php_version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.minimum_php_version }}
+          extensions: apcu
+          ini-values: xdebug.mode=coverage,memory_limit=4G
+      - name: install dependencies
+        run: composer install --no-interaction --prefer-dist
+      - name: create coverage
+        run: vendor/bin/phpunit --coverage-xml=build/coverage --log-junit=build/coverage/phpunit.junit.xml
+      - name: infection
+        run: vendor/bin/infection --coverage=build/coverage
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infection-html
+          path: build/coverage/infection.html
+          retention-days: 1
+      - uses: act10ns/slack@v2.1.0
+        with:
+          status: ${{ job.status }}
+          message: Infection tests failed {{ env.GITHUB_SERVER_URL }}/{{ env.GITHUB_REPOSITORY }}/actions/runs/{{ env.GITHUB_RUN_ID }}
+        if: failure()

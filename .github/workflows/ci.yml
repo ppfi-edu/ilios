@@ -1,0 +1,404 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  schedule:
+    - cron: '33 2 * * 1' # weekly, on Monday morning
+
+env:
+  MAILER_DSN: null://null
+  ILIOS_LOCALE: en
+  ILIOS_SECRET: ThisTokenIsNotSoSecretChangeIt
+  ILIOS_FILE_SYSTEM_STORAGE_PATH: /tmp
+  SYMFONY_DEPRECATIONS_HELPER: disabled=1
+  MESSENGER_TRANSPORT_DSN: doctrine://default
+  minimum_php_version: 8.3
+  DOCKER_BUILDKIT: 1
+
+  #token is tied to Jon's account on UCSF's SonarQube (type: project, name: ilios)
+  UCSF_SQ_TK: sqp_144d0f53089a18cd6733f79dc29ff98221662d1a
+
+jobs:
+  code_style:
+    name: Code Style
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Use PHP ${{ env.minimum_php_version }}
+      uses: shivammathur/setup-php@v2
+      with:
+        coverage: none
+        php-version: ${{ env.minimum_php_version }}
+        extensions: apcu
+    - name: install dependencies
+      run: composer install --no-interaction --prefer-dist
+    - name: Check Composer Lock
+      run: composer validate --no-check-all --no-check-version --strict
+    - name: lint PHP
+      run: vendor/bin/phpcs
+    - name: lint twig
+      run: bin/console lint:twig templates custom
+    - name: lint markdown
+      uses: DavidAnson/markdownlint-cli2-action@v19
+      with:
+        globs: |
+          CHANGELOG.md
+          CODE_OF_CONDUCT.md
+          CONTRIBUTING.md
+          README.md
+          docs/*.md
+    - name: lint yaml
+      run: |
+        vendor/bin/yaml-lint .gitpod.yml
+        vendor/bin/yaml-lint .github
+        vendor/bin/yaml-lint config
+        vendor/bin/yaml-lint docker
+        vendor/bin/yaml-lint docs
+        vendor/bin/yaml-lint compose.yaml
+    - name: phpstan
+      run: |
+        bin/console cache:warmup --env=test
+        vendor/bin/phpstan analyse --no-progress
+  tests:
+    name: PHPUnit Tests
+    needs: code_style
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      matrix:
+        php-version: [8.4, 8.3]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Use PHP ${{ matrix.php-version }}
+      uses: shivammathur/setup-php@v2
+      with:
+        coverage: pcov
+        php-version: ${{ matrix.php-version }}
+        extensions: apcu
+    - name: install dependencies
+      run: composer install --no-interaction --prefer-dist
+    - name: Run Tests
+      run: vendor/bin/phpunit --coverage-clover build/coverage.xml
+    - name: Archive Coverage Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-output
+        path: build/coverage.xml
+        overwrite: true
+        retention-days: 1
+
+  test_migrations_against_mysql:
+    name: Test Migrations Against MySQL
+    needs: code_style
+    runs-on: ubuntu-latest
+    env:
+      ILIOS_DATABASE_URL: mysql://root:root@127.0.0.1:3306/ilios?serverVersion=8.0.40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use PHP ${{ env.minimum_php_version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          coverage: none
+          php-version: ${{ env.minimum_php_version }}
+          extensions: apcu
+      - name: install dependencies
+        run: composer install --no-interaction --prefer-dist
+      - run: sudo systemctl start mysql.service
+      - name: Drop, Create, Migrate
+        run: |
+          bin/console doctrine:database:drop --if-exists --force
+          bin/console doctrine:database:create
+          bin/console doctrine:migrations:migrate  --no-interaction
+      - name: Validate Schema Matches Migrations
+        # Workaround from https://github.com/doctrine/migrations/issues/1406#issuecomment-2402548597
+        run: true && ! bin/console doctrine:migrations:diff
+
+  run_twice:
+    name: PHPUnit Run Twice
+    needs: code_style
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        php-version: [8.4, 8.3]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Use PHP ${{ matrix.php-version }}
+      uses: shivammathur/setup-php@v2
+      with:
+        coverage: none
+        php-version: ${{ matrix.php-version }}
+        extensions: apcu
+    - name: install dependencies
+      run: composer install --no-interaction --prefer-dist
+    - name: First Run
+      run: vendor/bin/phpunit --group twice
+    - name: Second Run
+      run: vendor/bin/phpunit --group twice
+
+  build_containers:
+    name: Build ${{ matrix.image }} (${{ matrix.arch }})
+    needs: code_style
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+        image:
+          - php-apache
+          - nginx
+          - fpm
+          - fpm-dev
+          - admin
+          - update-frontend
+          - consume-messages
+          - mysql
+          - mysql-demo
+          - opensearch
+          - redis
+          - tika
+    steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    - name: Build ${{ matrix.image }}
+      uses: docker/build-push-action@v6
+      with:
+        target: ${{ matrix.image }}
+        push: false
+        outputs: type=docker,dest=/tmp/${{ matrix.image }}-${{ matrix.arch }}.tar,compression=gzip
+        tags: ${{ matrix.image }}:${{ matrix.arch }}-testing
+        platforms: linux/${{ matrix.arch }}
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.image }}-${{ matrix.arch }}-image
+        path: /tmp/${{ matrix.image }}-${{ matrix.arch }}.tar
+        retention-days: 1
+
+  run_containers:
+    name: Run and Test Containers (${{ matrix.arch }})
+    needs: build_containers
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    env:
+      ILIOS_DATABASE_URL: mysql://root:root@127.0.0.1:3306/ilios?serverVersion=8.0.40
+      ILIOS_SECRET: DifferentSecret
+      ILIOS_FILE_SYSTEM_STORAGE_PATH: /tmp
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    steps:
+    - uses: actions/checkout@v4
+    - name: Drop, Create Database to use everywhere else
+      run: |
+        sudo systemctl start mysql.service
+        mysql -uroot -proot -e "DROP DATABASE IF EXISTS ilios"
+        mysql -uroot -proot -e "CREATE DATABASE ilios"
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: /tmp/
+        pattern: "*${{ matrix.arch }}-image"
+        merge-multiple: true
+    - name: Consume Messages
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/consume-messages-${{ matrix.arch }}.tar
+        docker run -d --name ilios-consume-messages -e ILIOS_SECRET -e ILIOS_DATABASE_URL -e ILIOS_FILE_SYSTEM_STORAGE_PATH consume-messages:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-consume-messages
+        docker stop ilios-consume-messages
+        docker rm --volumes ilios-consume-messages
+        docker image rm consume-messages:${{ matrix.arch }}-testing
+    - name: Apache PHP
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/php-apache-${{ matrix.arch }}.tar
+        docker run -d --name ilios-php-apache -e ILIOS_SECRET -e ILIOS_DATABASE_URL -e ILIOS_FILE_SYSTEM_STORAGE_PATH php-apache:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-php-apache
+        docker exec ilios-php-apache php /var/www/ilios/bin/console monitor:health
+        docker stop ilios-php-apache
+        docker rm --volumes ilios-php-apache
+        docker image rm php-apache:${{ matrix.arch }}-testing
+    - name: Nginx
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/nginx-${{ matrix.arch }}.tar
+        docker run -d --name ilios-nginx nginx:${{ matrix.arch }}-testing
+        sleep 15
+        docker ps
+        docker ps --filter "health=healthy" | grep -q ilios-nginx
+        docker stop ilios-nginx
+        docker rm --volumes ilios-nginx
+        docker image rm nginx:${{ matrix.arch }}-testing
+    - name: FPM
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/fpm-${{ matrix.arch }}.tar
+        docker run -d --name ilios-fpm -e ILIOS_SECRET -e ILIOS_DATABASE_URL -e ILIOS_FILE_SYSTEM_STORAGE_PATH fpm:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-fpm
+        docker exec ilios-fpm php bin/console monitor:health
+        docker stop ilios-fpm
+        docker rm --volumes ilios-fpm
+        docker image rm fpm:${{ matrix.arch }}-testing
+    - name: FPM Dev
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/fpm-dev-${{ matrix.arch }}.tar
+        docker run -d --name ilios-fpm-dev -e ILIOS_SECRET -e ILIOS_DATABASE_URL -e ILIOS_FILE_SYSTEM_STORAGE_PATH fpm-dev:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-fpm-dev
+        docker exec ilios-fpm-dev php bin/console monitor:health
+        docker stop ilios-fpm-dev
+        docker rm --volumes ilios-fpm-dev
+        docker image rm fpm-dev:${{ matrix.arch }}-testing
+    - name: Admin
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/admin-${{ matrix.arch }}.tar
+        docker run -d --name ilios-admin admin:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-admin
+        docker stop ilios-admin
+        docker rm --volumes ilios-admin
+        docker image rm admin:${{ matrix.arch }}-testing
+    - name: MySQL
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/mysql-${{ matrix.arch }}.tar
+        docker run -d --name ilios-mysql mysql:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-mysql
+        docker stop ilios-mysql
+        docker rm --volumes ilios-mysql
+        docker image rm mysql:${{ matrix.arch }}-testing
+    - name: MySQL Demo
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/mysql-demo-${{ matrix.arch }}.tar
+        docker run -d --name ilios-mysql-demo mysql-demo:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-mysql-demo
+        docker stop ilios-mysql-demo
+        docker rm --volumes ilios-mysql-demo
+        docker image rm mysql-demo:${{ matrix.arch }}-testing
+    - name: OpenSearch
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/opensearch-${{ matrix.arch }}.tar
+        docker run -d --name ilios-opensearch opensearch:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-opensearch
+        docker stop ilios-opensearch
+        docker rm --volumes ilios-opensearch
+        docker image rm opensearch:${{ matrix.arch }}-testing
+    - name: Redis
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/redis-${{ matrix.arch }}.tar
+        docker run -d --name ilios-redis redis:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-redis
+        docker stop ilios-redis
+        docker rm --volumes ilios-redis
+        docker image rm redis:${{ matrix.arch }}-testing
+    - name: Tika
+      if: ${{ always() }}
+      run: |
+        docker image load --input /tmp/tika-${{ matrix.arch }}.tar
+        docker run -d --name ilios-tika tika:${{ matrix.arch }}-testing
+        docker ps
+        docker ps | grep -q ilios-tika
+        docker stop ilios-tika
+        docker rm --volumes ilios-tika
+        docker image rm tika:${{ matrix.arch }}-testing
+    - name: Output Docker Logs
+      if: failure()
+      run: |
+        docker logs ilios-php-apache
+        docker logs ilios-nginx
+        docker logs ilios-fpm
+        docker logs ilios-fpm-dev
+        docker logs ilios-admin
+        docker logs ilios-consume-messages
+        docker logs ilios-mysql
+        docker logs ilios-mysql-demo
+        docker logs ilios-opensearch
+        docker logs ilios-redis
+        docker logs ilios-tika
+
+  check_setup_command:
+    name: Setup Command
+    needs: code_style
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-version: [8.4, 8.3]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          coverage: none
+          php-version: ${{ matrix.php-version }}
+          extensions: apcu
+      - name: Run Setup Command
+        run: bin/setup
+
+  check_update_frontend_command:
+    name: Update Frontend Command
+    needs: code_style
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-version: [8.4, 8.3]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          coverage: none
+          php-version: ${{ matrix.php-version }}
+          extensions: apcu
+      - name: install dependencies
+        run: composer install --no-interaction --prefer-dist
+      - name: Run Update Frontend
+        run: bin/console ilios:update-frontend
+
+  sonarqube_scan:
+    name: Scan with UCSF SonarQube
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # disable shallow clone for full access to code
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-output
+      - run: ls -lh coverage.xml
+      - uses: sonarsource/sonarqube-scan-action@v5.1
+        env:
+          SONAR_TOKEN: ${{ env.UCSF_SQ_TK }}
+          SONAR_HOST_URL: https://sonarqube.ucsf.edu
+        with:
+          args: >
+            -Dsonar.projectKey=ilios_ilios_99baf4a1-99a4-4d9a-adb9-2c1253c22751
+            -Dsonar.php.coverage.reportPaths=coverage.xml
+            -Dsonar.sources=bin,src,public,templates
+            -Dsonar.tests=tests
