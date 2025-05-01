@@ -1,0 +1,58 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Controller;
+
+use App\Service\AuthenticationInterface;
+use App\Service\Config;
+use App\Service\Index\Curriculum;
+use Composer\InstalledVersions;
+use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+use Symfony\Component\Routing\Annotation\Route;
+
+class ConfigController extends AbstractController
+{
+    #[Route(
+        '/application/config',
+        methods: ['GET'],
+    )]
+    public function getConfig(
+        Request $request,
+        Config $config,
+        Curriculum $curriculumSearch,
+        AuthenticationInterface $authenticationSystem,
+    ): JsonResponse {
+        $configuration = $authenticationSystem->getPublicConfigurationInformation($request);
+        $configuration['locale'] = $this->getParameter('kernel.default_locale');
+
+        $ldapUrl = $config->get('ldap_directory_url');
+        if (!empty($ldapUrl)) {
+            $configuration['userSearchType'] = 'ldap';
+        } else {
+            $configuration['userSearchType'] = 'local';
+        }
+        $configuration['maxUploadSize'] = UploadedFile::getMaxFilesize();
+        $configuration['apiVersion'] = $this->getParameter('ilios_api_version');
+        $configuration['appVersion'] = InstalledVersions::getPrettyVersion(InstalledVersions::getRootPackage()['name']);
+        $configuration['trackingEnabled'] = false; //feature removed, but still provided for frontend compatibility
+        $configuration['searchEnabled'] = $curriculumSearch->isEnabled();
+
+        $configuration['academicYearCrossesCalendarYearBoundaries'] = $config->get(
+            'academic_year_crosses_calendar_year_boundaries'
+        ) ?? false;
+
+        $configuration['materialStatusEnabled'] = $config->get(
+            'material_status_enabled'
+        ) ?? false;
+
+        $configuration['showCampusNameOfRecord'] = $config->get(
+            'showCampusNameOfRecord'
+        ) ?? false;
+
+        return new JsonResponse(['config' => $configuration]);
+    }
+}
