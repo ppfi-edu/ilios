@@ -1,0 +1,77 @@
+server {
+    listen       80;
+    server_name  localhost;
+    root   /srv/app/public;
+    server_tokens off;
+    client_max_body_size 105M;
+    resolver ${NGINX_NAMESERVERS} valid=10s;
+
+    location / {
+        gzip_static on;
+        # try to serve file directly, fallback to index.php
+        try_files $uri /index.php$is_args$args;
+    }
+
+    # cache fingerprinted ilios assets forever
+    # ex: sunburst-white-background192-68bd609abe5ea5043e544352c4ca9942.png
+    # ex: assets/chunk.56bf0f0960e34acefd19.js
+    location ~* "[a-z\-0-9]+-[a-z0-9]{15,}\.(css|js|png|svg)$" {
+        gzip_static on;
+        expires max;
+    }
+
+    # special handling for the webmanifest file which needs to send a content type
+    # otherwise this is identical to above local block.
+    # ex: manifest-bd12a81128e7457c600174adf270dd25.webmanifest
+    location ~* "manifest-[a-z\-0-9]+\.webmanifest$" {
+        gzip_static on;
+        expires max;
+        default_type application/manifest+json;
+    }
+
+    #Symfony Docs on nginx: https://symfony.com/doc/current/setup/web_server_configuration.html#nginx
+    # pass the PHP scripts to FastCGI server listening on :9000
+    location ~ ^/index\.php(/|$) {
+        # Use a local variable here to prevent nginx from attempting
+        # to do a DNS lookup when it first boots. By Disguising the
+        # hostname in this way we get a more resilient NGINX setup
+        set $fpmContainers ${FPM_CONTAINERS};
+
+        # nginx will now start if host is not reachable
+        fastcgi_pass $fpmContainers;
+        fastcgi_split_path_info ^(.+\.php)(/.*)$;
+        include fastcgi_params;
+
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $realpath_root;
+        fastcgi_param X-Forwarded-Proto $http_x_forwarded_proto;
+        fastcgi_param X-Forwarded-For $http_x_forwarded_for;
+        fastcgi_param X-Forwarded-Host $http_x_forwarded_host;
+
+        #increase buffer size for response headers since we send a large JWT and cookies
+        fastcgi_buffer_size 8k;
+
+        #increase buffer count for response body to accommodate our large JSON payloads
+        fastcgi_buffers 16 4k;
+
+        # Prevents URIs that include the front controller. This will 404:
+        # http://domain.tld/index.php/some-path
+        # Remove the internal directive to allow URIs like this
+        internal;
+
+        gzip on;
+        gzip_types application/json application/vnd.api+json;
+    }
+
+    # return 404 for all other php files not matching the front controller
+    # this prevents access to other php files you don't want to be accessible.
+    location ~ \.php$ {
+        return 404;
+    }
+
+    # deny access to .htaccess files, if Apache's document root
+    # concurs with nginx's one
+    location ~ /\.ht {
+        deny  all;
+    }
+}

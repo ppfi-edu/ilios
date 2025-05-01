@@ -1,0 +1,12 @@
+parameters:
+    symfony:
+        containerXmlPath: var/cache/test/App_KernelTestDebugContainer.xml
+        consoleApplicationLoader: tests/phpstan-console-application.php
+    paths:
+        - bin/
+        - config/
+        - public/
+        - src/
+        - tests/
+    level: 4
+    reportUnmatchedIgnoredErrors: true

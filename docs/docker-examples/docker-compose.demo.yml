@@ -1,0 +1,53 @@
+version: '3.5'
+volumes:
+  public:
+services:
+  nginx:
+    image: ilios/nginx:v3
+    environment:
+      - FPM_CONTAINERS=php:9000
+    depends_on:
+      - php
+    volumes:
+      - public:/srv/app/public:ro
+    ports:
+      - "8000:80"
+  db:
+    image: ilios/mysql-demo:v3
+  php:
+    image: ilios/fpm:v3
+    volumes:
+      - public:/srv/app/public
+    environment:
+      - ILIOS_DATABASE_URL=mysql://ilios:ilios@db/ilios
+      - ILIOS_REQUIRE_SECURE_CONNECTION=false
+      - ILIOS_ERROR_CAPTURE_ENABLED=false
+      - ILIOS_SEARCH_HOST=http://opensearch
+      - ILIOS_FILE_SYSTEM_STORAGE_PATH=/tmp
+      - ILIOS_TIKA_URL=http://tika:9998
+    depends_on:
+      - db
+  messages:
+    image: ilios/consume-messages:v3
+    environment:
+      - ILIOS_DATABASE_URL=mysql://ilios:ilios@db/ilios
+      - ILIOS_ERROR_CAPTURE_ENABLED=false
+      - ILIOS_SEARCH_HOST=http://opensearch
+      - ILIOS_FILE_SYSTEM_STORAGE_PATH=/tmp
+      - ILIOS_TIKA_URL=http://tika:9998
+    depends_on:
+        - db
+  opensearch:
+    image: ilios/opensearch:v3
+    environment:
+      - discovery.type=single-node
+    ports:
+      - "9200:9200"
+  redis:
+    image: ilios/redis:v3
+    ports:
+      - "6379:6379"
+  tika:
+    image: apache/tika:2.9.1.0-full
+    ports:
+      - "9998:9998"
